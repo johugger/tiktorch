@@ -180,6 +180,14 @@ class ModelHandler(Processor):
             logger.info("Updating state...")
             self.trainer.update_handler_model_state()
 
+    def update_optimizer_state(self):
+        logger = logging.getLogger('ModelHandler.update_optimizer_state')
+        optimizer_state = None
+        if self.trainer.is_ignited:
+            logger.info("Requesting optimizer state...")
+            optimizer_state = self.trainer.update_handler_optimizer_state()
+        return optimizer_state
+
     def dump_state(self, filename):
         state_dict = self.model.state_dict()
         torch.save(state_dict, filename)

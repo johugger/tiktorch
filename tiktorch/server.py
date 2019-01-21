@@ -320,26 +320,30 @@ class TikTorchServer(object):
                 logger.info("Received a request for the model state dict.")
                 self.meta_send({'id': 'DISPATCHING.MODEL_STATE_DICT_REQUEST'})
                 logger.info('Dispatch confirmed.')
-                self.request_model_state_dict()
+                self.request_state_dict('model')
+            elif request['id'] == 'DISPATCH.OPTIMIZER_STATE_DICT_REQUEST':
+                logger.info("Received a request for the optimizer state dict.")
+                self.meta_send({'id': 'DISPATCHING.OPTIMIZER_STATE_DICT_REQUEST'})
+                logger.info('Dispatch confirmed.')
+                self.request_state_dict('optimizer')
             else:
                 # Bad id
                 raise RuntimeError
 
-    def request_model_state_dict(self):
-        logger = logging.getLogger('TikTorchServer.request_model_state_dict')
-        logger.info('Requesting model state dict from handler....')
-        self.handler.update_state()
-        state_dict = io.BytesIO()
-        torch.save(self.model.state_dict(), f=state_dict)
+    def request_state_dict(self, key='model'):
+        assert key in ('model', 'optimizer')
+        logger = logging.getLogger('TikTorchServer.request_state_dict')
+        logger.info(f'Requesting {key} state dict from handler....')
+        state = io.BytesIO()
+        if key == 'model':
+            self.handler.update_state()
+            torch.save(self.model.state_dict(), f=state)
+        else:
+            torch.save(self.handler.update_optimizer_state(), f=state)
         logger.info('Sending state dict.')
-        self._zmq_socket.send(state_dict.getvalue())
+        self._zmq_socket.send(state.getvalue())
         logger.info('Sent state dict.')
-        state_dict.close()
-
-
-    def request_optimizer_state_dict(self):
-        pass
-
+        state.close()
 
     def poll_training_process(self):
         logger = logging.getLogger('TikTorchServer.poll_training_process')

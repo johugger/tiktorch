@@ -368,7 +368,20 @@ class TikTorchClient(object):
         return state_dict
 
     def request_optimizer_state_dict(self):
-        pass
+        logger = logging.getLogger('TikTorchClient.request_optimizer_state_dict')
+        logger.info("Check if training process is alive....")
+        if self.training_process_is_running():
+            logger.info("Waiting for lock...")
+            with self._main_lock:
+                logger.info("Requesting dispatch...")
+                assert self.request_dispatch('OPTIMIZER_STATE_DICT_REQUEST')
+                logger.info("Request successful. Waiting for optimizer state dict...")
+                state_dict = self._zmq_socket.recv()
+                logger.info("Optimizer state dict received.")
+        else:
+            logger.info("Training process is not alive. No need to request the state.")
+            state_dict = None
+        return state_dict
 
 
 def test_client_forward():
@@ -501,11 +514,31 @@ def test_client_state_request():
     import torch
     client = TikTorchClient(tiktorch_config=INIT_DATA[0],
                             binary_model_file=INIT_DATA[1],
-                            binary_model_state=INIT_DATA[2])
+                            binary_model_state=INIT_DATA[2],
+                            port=np.random.randint(100,20000))
 
-    state_dict = client.request_model_state_dict()
-    file = io.BytesIO(state_dict)
-    state_dict = torch.load(file, map_location=lambda storage, loc: storage)
+    model_state_dict = client.request_model_state_dict()
+    with io.BytesIO(model_state_dict) as file:
+        model_state_dict = torch.load(file, map_location=lambda storage, loc: storage)
+
+    logging.info("Sending train data and labels...")
+    train_data = [np.random.uniform(size=(1, 256, 256)).astype('float32') for _ in range(4)]
+    train_labels = [np.random.randint(0, 2, size=(1, 256, 256)).astype('float32') for _ in range(4)]
+    client.train(train_data, train_labels, list(range(len(train_data))))
+    logging.info("Sent train data and labels and waiting for 5s...")
+
+    time.sleep(5)
+
+    logging.info("Polling")
+    is_running = client.training_process_is_running()
+    logging.info(f"Training process running? {is_running}")
+
+    optim_state_dict = client.request_optimizer_state_dict()
+    with io.BytesIO(optim_state_dict) as file:
+        pass
+
+    time.sleep(10)
+
     client.shutdown()
 
 if __name__ == '__main__':

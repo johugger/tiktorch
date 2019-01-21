@@ -47,11 +47,13 @@ class Trainer(object):
         # Training
         self._data_queue: mp.Queue = None
         self._state_queue: mp.Queue = None
+        self._optimizer_state_queue: mp.Queue = None
         self._hparams_queue: mp.Queue = None
         self._change_hparams_event: mp.Event = None
         self._abort_event: mp.Event = None
         self._pause_event: mp.Event = None
-        self._state_request_event = None
+        self._state_request_event: mp.Event = None
+        self._optimizer_state_request_event: mp.Event = None
         self._training_process: mp.Process = None
         self._ignited = False
         # Publics
@@ -88,16 +90,59 @@ class Trainer(object):
         return self._handler.device
 
     @staticmethod
+    def _state_server(state_obj, stop_server: thr.Event, state_lock: thr.Lock,
+                      state_queue: mp.Event, state_request: mp.Event):
+        """
+        This function listens if a state request has been set. If it is,
+        it serves the state_dict in the queue.
+        """
+        assert isinstance(state_obj, torch.optim) or isinstance(state_obj, torch.nn)
+        while True:
+            if stop_server.is_set():
+                logger.info("Stopping state server...")
+                break
+            if state_request.is_set():
+                try:
+                    logger.info("Obtained request for new state. Waiting for lock...")
+                    with state_lock:
+                        state_queue.put_nowait(state_obj.state_dict())
+                        logger.info("Put most recent state in queue.")
+                except queue.Full:
+                    logger.info("State queue is full.")
+                    pass
+                state_request.clear()
+                logger.info("State request cleared.")
+            time.sleep(0.01)
+
+    @staticmethod
+    def _kill_state_server(thread: thr.Thread, stop_server: thr.Event, num_kill_attempts=5):
+        logger.info("Killing state server thread...")
+        stop_server.set()
+        kill_attempts = 0
+        while thread.is_alive():
+            time.sleep(1)
+            kill_attempts += 1
+            logger.info(f"Attempt {kill_attempts} of {num_kill_attempts}.")
+            if kill_attempts > num_kill_attempts:
+                break
+        if thread.is_alive():
+            logger.warning(f"Failed to kill state server after {num_kill_attempts} attempts.")
+        else:
+            logger.info("State server killed.")
+
+    @staticmethod
     def _train_process(model_state: dict,
                        model_config: tuple,
                        device: torch.device,
                        data_queue: mp.Queue,
                        augmentor: aug.AugmentationSuite,
                        state_queue: mp.Queue,
+                       optimizer_queue: mp.Queue,
                        abort: mp.Event,
                        pause: mp.Event,
                        change_hparams: mp.Event,
                        state_request: mp.Event,
+                       optimizer_state_request: mp.Event,
                        use_cache_keeping: bool,
                        hparams_queue: mp.Queue,
                        log_directory: str):
@@ -115,54 +160,29 @@ class Trainer(object):
             tensorboard = None
             logger.warning("Not writing tensorboard logs.")
 
+        # Set up server to listen for state requests
         _state_lock = thr.Lock()
         _stop_server = thr.Event()
-
-        # This guy listens if state request has been set; if it is, it serves the state_dict in
-        # the queue.
-        def _state_server():
-            while True:
-                if _stop_server.is_set():
-                    logger.info("Stopping state server...")
-                    break
-                if state_request.is_set():
-                    try:
-                        logger.info("Obtained request for new state. Waiting for lock...")
-                        with _state_lock:
-                            state_queue.put_nowait(model.state_dict())
-                            logger.info("Put most recent state in queue.")
-                    except queue.Full:
-                        logger.info("State queue is full.")
-                        pass
-                    state_request.clear()
-                    logger.info("State request cleared.")
-                time.sleep(0.01)
-
-        # Set up server to listen for state requests
         logger.info("Spooling state server thread...")
-        server_thread = thr.Thread(target=_state_server, args=())
+        server_thread = thr.Thread(target=Trainer._state_server,
+                                   args=(model, _stop_server, _state_lock,
+                                         state_queue, state_request))
         server_thread.start()
-
-        def _kill_state_server(num_kill_attempts=5):
-            logger.info("Killing state server thread...")
-            _stop_server.set()
-            kill_attempts = 0
-            while server_thread.is_alive():
-                time.sleep(1)
-                kill_attempts += 1
-                logger.info(f"Attempt {kill_attempts} of {num_kill_attempts}.")
-                if kill_attempts > num_kill_attempts:
-                    break
-            if server_thread.is_alive():
-                logger.warning(f"Failed to kill state server after {num_kill_attempts} attempts.")
-            else:
-                logger.info("State server killed.")
 
         logger.info(f"Initializing Loss and Optimizer.")
         # Set up what's needed for training
         hparams = hparams_queue.get()
         criterion = getattr(torch.nn, hparams.criterion_name)(**hparams.criterion_kwargs)
         optim = getattr(torch.optim, hparams.optimizer_name)(model.parameters(), **hparams.optimizer_kwargs)
+
+        _optim_state_lock = thr.Lock()
+        _optim_stop_server = thr.Event()
+        logger.info("Spooling optimizer state server thread ...")
+        optim_server_thread = thr.Thread(target=Trainer._state_server,
+                                         args=(optim, _optim_stop_server, _optim_state_lock,
+                                               optimizer_queue, optimizer_state_request))
+        optim_server_thread.start()
+        
         # Init a cache. In case there are not enough batches in data_queue,
         # we'll use it to top up the batch with what's in this cache.
         data_cache = deque(maxlen=hparams.cache_size)
@@ -209,12 +229,21 @@ class Trainer(object):
                 change_hparams.clear()
                 try:
                     hparams = hparams_queue.get_nowait()
+                    logger.info('Killing optimizer state server thread...')
+                    Trainer._kill_state_server(optim_server_thread, _optim_stop_server)
+                    logger.info("Changing hyperparameters: initializing loss and optimizer.")
+                    criterion = getattr(torch.nn, hparams.criterion_name)(**hparams.criterion_kwargs)
+                    optim = getattr(torch.optim, hparams.optimizer_name)(model.parameters(), **hparams.optimizer_kwargs)
+                    logger.info('Spooling new optimizer state server thread...')
+                    _optim_state_lock = thr.Lock()
+                    _optim_stop_server = thr.Event()
+                    optim_server_thread = thr.Thread(target=Trainer._state_server,
+                                                     args=(optim, _optim_stop_server, _optim_state_lock,
+                                                           optimizer_queue, optimizer_state_request))
+                    optim_server_thread.start()
                 except queue.Empty:
-                    logger.info(f"Hyperparameter queue is empty.")
+                    logger.info("Hyperparameter queue is empty.")
                     pass
-                logger.info(f"Changing hyperparameters: initializing loss and optimizer.")
-                criterion = getattr(torch.nn, hparams.criterion_name)(**hparams.criterion_kwargs)
-                optim = getattr(torch.optim, hparams.optimizer_name)(model.parameters(), **hparams.optimizer_kwargs)
                     
             # Check if a new state is requested
             if state_request.is_set():
@@ -230,7 +259,8 @@ class Trainer(object):
             # Check if abort event is set
             if abort.is_set():
                 logger.info(f"Aborting...")
-                _kill_state_server()
+                Trainer._kill_state_server(server_thread, _stop_server)
+                Trainer._kill_state_server(optim_server_thread, _optim_stop_server)
                 break
             if pause.is_set():
                 logger.info(f"Waiting for resume...")
@@ -284,7 +314,8 @@ class Trainer(object):
                     logger.error(f"LOLWTF: len(batch) = {len(batch)}, "
                                  f"len(data_cache) = {len(data_cache)}")
                     # Stop state server before throwing up error
-                    _kill_state_server()
+                    Trainer._kill_state_server(server_thread, _stop_server)
+                    Trainer._kill_state_server(optim_server_thread, _optim_stop_server)
                     raise RuntimeError
 
             logger.info(f"Updating with {len(batch)} samples...")
@@ -319,7 +350,8 @@ class Trainer(object):
                     tensorboard.add_scalar('loss', loss.item(), global_step=(iter_count - 1))
                     logger.info(f"Logged iteration {iter_count}.")
             except Exception:
-                _kill_state_server()
+                Trainer._kill_state_server(server_thread, _stop_server)
+                Trainer._kill_state_server(optim_server_thread, _optim_stop_server)
                 raise
 
     def ignition(self):
@@ -331,11 +363,13 @@ class Trainer(object):
         logger.info("Prepping Queue and Event...")
         self._data_queue = mp.Queue()
         self._state_queue = mp.Queue()
+        self._optimizer_state_queue = mp.Queue()
         self._hparams_queue = mp.Queue()
         self._hparams_queue.put(self.hparams)
         self._abort_event = mp.Event()
         self._pause_event = mp.Event()
         self._state_request_event = mp.Event()
+        self._optimizer_state_request_event = mp.Event()
         self._change_hparams_event = mp.Event()
         logger.info("Sharing Memory...")
         # self.share_memory()
@@ -347,9 +381,11 @@ class Trainer(object):
                                             args=(model_state, model_config, self.device,
                                                   self._data_queue, self.augmentor,
                                                   self._state_queue,
+                                                  self._optimizer_state_queue,
                                                   self._abort_event, self._pause_event,
                                                   self._change_hparams_event,
                                                   self._state_request_event,
+                                                  self._optimizer_state_request_event,
                                                   self.USE_CACHE_KEEPING,
                                                   self._hparams_queue,
                                                   self.log_directory))
@@ -358,15 +394,24 @@ class Trainer(object):
         logger.info("We have lift off.")
         self._ignited = True
 
-    def _drain_state_queue(self):
+    def _drain_state_queue(self, key='model'):
+        assert key in ('model', 'optimizer')
         logger = logging.getLogger('Trainer._drain_state_queue')
         state = None
-        while True:
-            try:
-                state = self._state_queue.get_nowait()
-                logger.info("Found residual state in state_queue.")
-            except queue.Empty:
-                break
+        if key == 'model':
+            while True:
+                try:
+                    state = self._state_queue.get_nowait()
+                    logger.info("Found residual state in state_queue.")
+                except queue.Empty:
+                    break
+        else:
+            while True:
+                try:
+                    state = self._optimizer_state_queue.get_nowait()
+                    logger.info("Found residual state in optimizer_state_queue.")
+                except queue.Empty:
+                    break
         return state
 
     def update_handler_model_state(self):
@@ -388,6 +433,20 @@ class Trainer(object):
         if state is not None:
             self.model.load_state_dict(state)
             logger.info("Loaded state.")
+
+    def update_handler_optimizer_state(self):
+        logger = logging.getLogger('Trainer.update_handler_optimizer_state')
+        assert self._ignited, "Training process not ignited."
+        logger.info("Requesting new state.")
+        state = self._drain_state_queue(key='optimizer')
+        self._optimizer_state_request_event.set()
+        try:
+            logger.info("Waiting for new state...")
+            state = self._optimizer_state_queue.get(timeout=STATE_QUEUE_GET_TIMEOUT)
+            logger.info("Acquired new state")
+        except queue.Empty:
+            logger.info("Failed to acquire new state...")
+        return state
 
     def shut_down_training_process(self):
         if self._training_process is not None:
